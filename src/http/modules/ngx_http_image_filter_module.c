@@ -36,6 +36,9 @@
 #define NGX_HTTP_IMAGE_BUFFERED  0x08
 
 
+ #define ROTATION_FROM_EXIF      999
+
+
 typedef struct {
     ngx_uint_t                   filter;
     ngx_uint_t                   width;
@@ -112,6 +115,9 @@ static char *ngx_http_image_filter_jpeg_quality(ngx_conf_t *cf,
 static char *ngx_http_image_filter_sharpen(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_image_filter_init(ngx_conf_t *cf);
+
+static int parseExifOrientation(const unsigned char *buf, unsigned len);
+static int angle_from_exif_orientation(int orientation, ngx_log_t *log);
 
 
 static ngx_command_t  ngx_http_image_filter_commands[] = {
@@ -523,6 +529,10 @@ ngx_http_image_process(ngx_http_request_t *r)
     ctx->angle = ngx_http_image_filter_get_value(r, conf->acv, conf->angle);
 
     if (conf->filter == NGX_HTTP_IMAGE_ROTATE) {
+        if (ctx->angle == ROTATION_FROM_EXIF) {
+            int orientation = parseExifOrientation(ctx->image, ctx->length);
+            ctx->angle = angle_from_exif_orientation(orientation, r->connection->log);
+        }
 
         if (ctx->angle != 90 && ctx->angle != 180 && ctx->angle != 270) {
             return NULL;
@@ -639,6 +649,190 @@ ngx_http_image_length(ngx_http_request_t *r, ngx_buf_t *b)
     }
 
     r->headers_out.content_length = NULL;
+}
+
+/*
+Exif parsing code based on https://github.com/mayanklahiri/easyexif by Mayank Lahiri
+
+Copyright (c) 2010-2015 Mayank Lahiri
+mlahiri@gmail.com
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+-- Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+-- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY EXPRESS
+  OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN
+  NO EVENT SHALL THE FREEBSD PROJECT OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+  INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+  OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+  EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+**/
+// No JPEG markers found in buffer, possibly invalid JPEG file
+#define PARSE_EXIF_ERROR_NO_JPEG              -1
+// No EXIF header found in JPEG file.
+#define PARSE_EXIF_ERROR_NO_EXIF              -2
+// Byte alignment specified in EXIF file was unknown (not Motorola or Intel).
+#define PARSE_EXIF_ERROR_UNKNOWN_BYTEALIGN    -3
+// EXIF header was found, but data was corrupted.
+#define PARSE_EXIF_ERROR_CORRUPT              -4
+
+
+static unsigned int parse32(const unsigned char *buf, int is_intel) {
+  if (is_intel)
+    return ((unsigned)buf[3]<<24) | ((unsigned)buf[2]<<16) |
+           ((unsigned)buf[1]<<8)  | buf[0];
+
+  return ((unsigned)buf[0]<<24) | ((unsigned)buf[1]<<16) |
+         ((unsigned)buf[2]<<8)  | buf[3];
+}
+
+
+static unsigned short parse16(const unsigned char *buf, int is_intel) {
+  if (is_intel)
+    return ((unsigned) buf[1]<<8) | buf[0];
+  return ((unsigned) buf[0]<<8) | buf[1];
+}
+
+
+// Main parsing function for an EXIF segment.
+// PARAM: 'buf' start of the EXIF TIFF, which must be the bytes "Exif\0\0".
+// PARAM: 'len' length of buffer
+static int parseExifOrientationFromSegment(const unsigned char *buf, unsigned len) {
+  int alignIntel = 1;     // byte alignment (defined in EXIF header)
+  unsigned offs   = 0;        // current offset into buffer
+  if (!buf || len < 6)
+    return PARSE_EXIF_ERROR_NO_EXIF;
+
+  if (memcmp(buf, "Exif\0\0", 6)!=0)
+    return PARSE_EXIF_ERROR_NO_EXIF;
+  offs += 6;
+
+  // Now parsing the TIFF header. The first two bytes are either "II" or
+  // "MM" for Intel or Motorola byte alignment. Sanity check by parsing
+  // the unsigned short that follows, making sure it equals 0x2a. The
+  // last 4 bytes are an offset into the first IFD, which are added to
+  // the global offset counter. For this block, we expect the following
+  // minimum size:
+  //  2 bytes: 'II' or 'MM'
+  //  2 bytes: 0x002a
+  //  4 bytes: offset to first IDF
+  // -----------------------------
+  //  8 bytes
+  if (offs + 8 > len)
+    return PARSE_EXIF_ERROR_CORRUPT;
+  //unsigned tiff_header_start = offs;
+  if (buf[offs] == 'I' && buf[offs+1] == 'I')
+    alignIntel = 1;
+  else {
+    if(buf[offs] == 'M' && buf[offs+1] == 'M')
+      alignIntel = 0;
+    else
+      return PARSE_EXIF_ERROR_UNKNOWN_BYTEALIGN;
+  }
+  //this->ByteAlign = alignIntel;
+  offs += 2;
+  if (0x2a != parse16(buf+offs, alignIntel))
+    return PARSE_EXIF_ERROR_CORRUPT;
+  offs += 2;
+  unsigned first_ifd_offset = parse32(buf + offs, alignIntel);
+  offs += first_ifd_offset - 4;
+  if (offs >= len)
+    return PARSE_EXIF_ERROR_CORRUPT;
+
+  // Now parsing the first Image File Directory (IFD0, for the main image).
+  // An IFD consists of a variable number of 12-byte directory entries. The
+  // first two bytes of the IFD section contain the number of directory
+  // entries in the section. The last 4 bytes of the IFD contain an offset
+  // to the next IFD, which means this IFD must contain exactly 6 + 12 * num
+  // bytes of data.
+  if (offs + 2 > len)
+    return PARSE_EXIF_ERROR_CORRUPT;
+  int num_entries = parse16(buf + offs, alignIntel);
+  if (offs + 6 + 12 * num_entries > len)
+    return PARSE_EXIF_ERROR_CORRUPT;
+  offs += 2;
+  //unsigned exif_sub_ifd_offset = len;
+  //unsigned gps_sub_ifd_offset  = len;
+  while (--num_entries >= 0) {
+
+    unsigned short tagId  = parse16(buf + offs, alignIntel);
+    unsigned short tagFormat  = parse16(buf + offs + 2, alignIntel);
+    switch (tagId) {
+      case 0x112:
+        if (tagFormat == 3)
+          return parse16((const unsigned char *) buf + offs + 8, alignIntel);
+        else
+          return PARSE_EXIF_ERROR_CORRUPT;
+        break;
+    }
+    offs += 12;
+  }
+
+  return 0;
+}
+
+
+// Locates the EXIF segment and parses it using parseFromEXIFSegment
+static int parseExifOrientation(const unsigned char *buf, unsigned len) {
+  // Sanity check: all JPEG files start with 0xFFD8 and end with 0xFFD9
+  // This check also ensures that the user has supplied a correct value for len.
+  if (!buf || len < 4)
+    return PARSE_EXIF_ERROR_NO_EXIF;
+  if (buf[0] != 0xFF || buf[1] != 0xD8)
+    return PARSE_EXIF_ERROR_NO_JPEG;
+  if (buf[len-2] != 0xFF || buf[len-1] != 0xD9)
+    return PARSE_EXIF_ERROR_NO_JPEG;
+
+  // Scan for EXIF header (bytes 0xFF 0xE1) and do a sanity check by
+  // looking for bytes "Exif\0\0". The marker length data is in Motorola
+  // byte order, which results in the 'FALSE' parameter to parse16().
+  // The marker has to contain at least the TIFF header, otherwise the
+  // EXIF data is corrupt. So the minimum length specified here has to be:
+  //   2 bytes: section size
+  //   6 bytes: "Exif\0\0" string
+  //   2 bytes: TIFF header (either "II" or "MM" string)
+  //   2 bytes: TIFF magic (short 0x2a00 in Motorola byte order)
+  //   4 bytes: Offset to first IFD
+  // =========
+  //  16 bytes
+  unsigned offs = 0;        // current offset into buffer
+  for (offs = 0; offs < len-1; offs++)
+    if (buf[offs] == 0xFF && buf[offs+1] == 0xE1)
+      break;
+  if (offs + 4 > len)
+    return PARSE_EXIF_ERROR_NO_EXIF;
+  offs += 2;
+  unsigned short section_length = parse16(buf + offs, 0);
+  if (offs + section_length > len || section_length < 16)
+    return PARSE_EXIF_ERROR_CORRUPT;
+  offs += 2;
+
+  return parseExifOrientationFromSegment(buf + offs, len - offs);
+}
+
+static int angle_from_exif_orientation(int orientation, ngx_log_t *log)
+{
+    if (orientation==3)
+        return 180;
+    if (orientation==6)
+        return 270;
+    if (orientation==8)
+        return 90;
+
+    ngx_log_error(NGX_LOG_ERR, log, 0,
+                  "image filter: unsuported orientation %O", orientation);
+    return 0;
 }
 
 
@@ -769,6 +963,12 @@ ngx_http_image_resize(ngx_http_request_t *r, ngx_http_image_filter_ctx_t *ctx)
     sy = gdImageSY(src);
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_image_filter_module);
+
+    if (ctx->angle == ROTATION_FROM_EXIF) {
+        int orientation = parseExifOrientation(ctx->image, ctx->length);
+        ctx->angle = angle_from_exif_orientation(orientation, r->connection->log);
+    }
+
 
     if (!ctx->force
         && ctx->angle == 0
@@ -1312,14 +1512,17 @@ ngx_http_image_filter(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             if (cv.lengths == NULL) {
-                n = ngx_http_image_filter_value(&value[i]);
+                if (ngx_strcmp(value[i].data, "exif") == 0) {
+                    imcf->angle = ROTATION_FROM_EXIF;
+                } else {
+                    n = ngx_http_image_filter_value(&value[i]);
 
-                if (n != 90 && n != 180 && n != 270) {
-                    goto failed;
+                    if (n != 90 && n != 180 && n != 270) {
+                        goto failed;
+                    }
+
+                    imcf->angle = (ngx_uint_t) n;
                 }
-
-                imcf->angle = (ngx_uint_t) n;
-
             } else {
                 imcf->acv = ngx_palloc(cf->pool,
                                        sizeof(ngx_http_complex_value_t));
