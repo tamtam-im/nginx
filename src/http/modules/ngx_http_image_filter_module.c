@@ -36,7 +36,7 @@
 #define NGX_HTTP_IMAGE_BUFFERED  0x08
 
 
- #define ROTATION_FROM_EXIF      999
+#define ROTATION_FROM_EXIF      999
 
 
 typedef struct {
@@ -830,8 +830,10 @@ static int angle_from_exif_orientation(int orientation, ngx_log_t *log)
     if (orientation==8)
         return 90;
 
-    ngx_log_error(NGX_LOG_ERR, log, 0,
+    if (orientation != 0 && orientation != 1) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
                   "image filter: unsuported orientation %O", orientation);
+    }
     return 0;
 }
 
