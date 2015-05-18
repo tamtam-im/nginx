@@ -530,8 +530,12 @@ ngx_http_image_process(ngx_http_request_t *r)
 
     if (conf->filter == NGX_HTTP_IMAGE_ROTATE) {
         if (ctx->angle == ROTATION_FROM_EXIF) {
-            int orientation = parseExifOrientation(ctx->image, ctx->length);
-            ctx->angle = angle_from_exif_orientation(orientation, r->connection->log);
+            if (ctx->type == NGX_HTTP_IMAGE_JPEG) {
+                int orientation = parseExifOrientation(ctx->image, ctx->length);
+                ctx->angle = angle_from_exif_orientation(orientation, r->connection->log);
+            } else {
+                ctx->angle = 0;
+            }
         }
 
         if (ctx->angle != 90 && ctx->angle != 180 && ctx->angle != 270) {
@@ -967,8 +971,12 @@ ngx_http_image_resize(ngx_http_request_t *r, ngx_http_image_filter_ctx_t *ctx)
     conf = ngx_http_get_module_loc_conf(r, ngx_http_image_filter_module);
 
     if (ctx->angle == ROTATION_FROM_EXIF) {
-        int orientation = parseExifOrientation(ctx->image, ctx->length);
-        ctx->angle = angle_from_exif_orientation(orientation, r->connection->log);
+        if (ctx->type == NGX_HTTP_IMAGE_JPEG) {
+            int orientation = parseExifOrientation(ctx->image, ctx->length);
+            ctx->angle = angle_from_exif_orientation(orientation, r->connection->log);
+        } else {
+            ctx->angle = 0;
+        }
     }
 
 
