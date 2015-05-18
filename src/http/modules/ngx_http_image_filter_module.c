@@ -834,7 +834,8 @@ static int angle_from_exif_orientation(int orientation, ngx_log_t *log)
     if (orientation==8)
         return 90;
 
-    if (orientation != 0 && orientation != 1) {
+    if (orientation > 1) {
+        // ^ this excludes values of 0 and 1 and failed exif parsing codes which are < 0
         ngx_log_error(NGX_LOG_ERR, log, 0,
                   "image filter: unsuported orientation %O", orientation);
     }
